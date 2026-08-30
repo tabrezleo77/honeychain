@@ -1,0 +1,81 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum Role {
+  FARMER
+  LAB
+  BUYER
+  GOV_ADMIN
+}
+
+enum BatchState {
+  RAW_HARVEST
+  LAB_VERIFIED
+  PACKAGED_RETAIL
+}
+
+model User {
+  id             String      @id @default(uuid())
+  name           String
+  email          String      @unique
+  passwordHash   String
+  wallet_address String?
+  role           Role        @default(FARMER)
+  createdAt      DateTime    @default(now())
+  hives          Hive[]
+  labReports     LabReport[]
+}
+
+model Hive {
+  id               String         @id @default(uuid())
+  hardware_mac     String         @unique
+  cluster_location String
+  did_identifier   String         @unique
+  farmer_id        String
+  farmer           User           @relation(fields: [farmer_id], references: [id])
+  batches          Batch[]
+  telemetryLogs    TelemetryLog[]
+}
+
+model Batch {
+  id             String      @id @default(uuid())
+  batch_code     String      @unique
+  raw_weight_kg  Float
+  current_state  BatchState  @default(RAW_HARVEST)
+  nft_token_id   String?
+  ipfs_lab_hash  String?
+  hive_id        String
+  hive           Hive        @relation(fields: [hive_id], references: [id])
+  labReport      LabReport?
+  createdAt      DateTime    @default(now())
+}
+
+model TelemetryLog {
+  id             String   @id @default(uuid())
+  hive_id        String
+  hive           Hive     @relation(fields: [hive_id], references: [id], onDelete: Cascade)
+  timestamp      DateTime @default(now())
+  weight_kg      Float
+  temperature_c  Float
+  humidity_pct   Float
+  zk_proof_hash  String?
+}
+
+model LabReport {
+  id                 String   @id @default(uuid())
+  batch_id           String   @unique
+  batch              Batch    @relation(fields: [batch_id], references: [id], onDelete: Cascade)
+  moisture_pct       Float
+  hmf_ppm            Float
+  c4_sugars_pct      Float
+  lab_inspector_id   String
+  lab_inspector      User     @relation(fields: [lab_inspector_id], references: [id])
+  pdf_ipfs_hash      String
+  createdAt          DateTime @default(now())
+}

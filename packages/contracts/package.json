@@ -1,0 +1,23 @@
+{
+  "name": "@honey-chain/contracts",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "deploy": "hardhat run scripts/deploy.ts",
+    "deploy:amoy": "hardhat run scripts/deploy.ts --network amoy"
+  },
+  "dependencies": {
+    "@openzeppelin/contracts": "^5.0.1"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^4.0.0",
+    "hardhat": "^2.19.4",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.3.3",
+    "chai": "^4.3.7",
+    "@types/chai": "^4.3.5",
+    "@types/mocha": "^10.0.1"
+  }
+}
