@@ -362,166 +362,806 @@ function authenticateToken(req: AuthRequest, res: Response, next: NextFunction) 
 }
 
 // -------------------------------------------------------------------------
-// ROUTES
+// IN-MEMORY DATABASE FALLBACK STORE
+// -------------------------------------------------------------------------
+const inMemoryStore = {
+  users: [] as any[],
+  hives: [] as any[],
+  telemetryLogs: [] as any[],
+  alerts: [] as any[]
+};
+
+const dbService = {
+  async findUserByEmail(email: string) {
+    try {
+      return await prisma.user.findUnique({ where: { email } });
+    } catch {
+      return inMemoryStore.users.find(u => u.email.toLowerCase() === email.toLowerCase()) || null;
+    }
+  },
+
+  async findUserById(id: string) {
+    try {
+      return await prisma.user.findUnique({ where: { id } });
+    } catch {
+      return inMemoryStore.users.find(u => u.id === id) || null;
+    }
+  },
+
+  async findUserByEmailOrUsername(email: string, username: string) {
+    try {
+      return await prisma.user.findFirst({
+        where: {
+          OR: [{ email }, { username }]
+        }
+      });
+    } catch {
+      return inMemoryStore.users.find(u => u.email.toLowerCase() === email.toLowerCase() || (u.username && u.username.toLowerCase() === username.toLowerCase())) || null;
+    }
+  },
+
+  async createUser(data: any) {
+    const newUser = {
+      id: crypto.randomUUID(),
+      name: data.name,
+      username: data.username || data.name,
+      email: data.email,
+      passwordHash: data.passwordHash,
+      wallet_address: data.wallet_address || null,
+      role: data.role || 'FARMER',
+      createdAt: new Date()
+    };
+    try {
+      return await prisma.user.create({ data });
+    } catch {
+      inMemoryStore.users.push(newUser);
+      return newUser;
+    }
+  },
+
+  async createHive(data: any) {
+    const newHive = {
+      id: crypto.randomUUID(),
+      deviceName: data.deviceName,
+      hardware_mac: data.hardware_mac,
+      cluster_location: data.cluster_location,
+      did_identifier: data.did_identifier,
+      deviceApiKey: data.deviceApiKey,
+      status: data.status || 'online',
+      samplingIntervalSec: data.samplingIntervalSec || 5,
+      lastActiveAt: data.lastActiveAt || new Date(),
+      farmer_id: data.farmer_id
+    };
+    try {
+      return await prisma.hive.create({ data });
+    } catch {
+      inMemoryStore.hives.push(newHive);
+      return newHive;
+    }
+  },
+
+  async findHivesByFarmer(farmerId: string) {
+    try {
+      return await prisma.hive.findMany({ where: { farmer_id: farmerId } });
+    } catch {
+      return inMemoryStore.hives.filter(h => h.farmer_id === farmerId);
+    }
+  },
+
+  async findHiveByIdOrMac(idOrMac: string) {
+    const rawId = idOrMac.replace(/^dev_/, '');
+    try {
+      return await prisma.hive.findFirst({
+        where: {
+          OR: [{ id: rawId }, { id: idOrMac }, { hardware_mac: idOrMac }]
+        }
+      });
+    } catch {
+      return inMemoryStore.hives.find(h => h.id === rawId || h.id === idOrMac || h.hardware_mac === idOrMac || h.hardware_mac === idOrMac.toUpperCase()) || null;
+    }
+  },
+
+  async findHiveByApiKey(apiKey: string) {
+    try {
+      return await prisma.hive.findFirst({ where: { deviceApiKey: apiKey } });
+    } catch {
+      return inMemoryStore.hives.find(h => h.deviceApiKey === apiKey) || null;
+    }
+  },
+
+  async findFirstFarmer() {
+    try {
+      return await prisma.user.findFirst({ where: { role: Role.FARMER } });
+    } catch {
+      return inMemoryStore.users.find(u => u.role === 'FARMER') || null;
+    }
+  },
+
+  async updateHiveStatus(hiveId: string, status: string, lastActiveAt: Date) {
+    try {
+      return await prisma.hive.update({
+        where: { id: hiveId },
+        data: { status, lastActiveAt }
+      });
+    } catch {
+      const h = inMemoryStore.hives.find(x => x.id === hiveId);
+      if (h) {
+        h.status = status;
+        h.lastActiveAt = lastActiveAt;
+      }
+      return h;
+    }
+  },
+
+  async deleteHive(hiveId: string) {
+    try {
+      await prisma.hive.delete({ where: { id: hiveId } });
+    } catch {
+      const idx = inMemoryStore.hives.findIndex(x => x.id === hiveId);
+      if (idx !== -1) inMemoryStore.hives.splice(idx, 1);
+    }
+  },
+
+  async createTelemetryLog(data: any) {
+    const newLog = {
+      id: crypto.randomUUID(),
+      hive_id: data.hive_id,
+      weight_kg: data.weight_kg,
+      temperature_c: data.temperature_c,
+      humidity_pct: data.humidity_pct,
+      timestamp: data.timestamp || new Date(),
+      zk_proof_hash: data.zk_proof_hash
+    };
+    try {
+      return await prisma.telemetryLog.create({ data });
+    } catch {
+      inMemoryStore.telemetryLogs.push(newLog);
+      return newLog;
+    }
+  },
+
+  async getLatestTelemetryLog(hiveId: string) {
+    try {
+      return await prisma.telemetryLog.findFirst({
+        where: { hive_id: hiveId },
+        orderBy: { timestamp: 'desc' }
+      });
+    } catch {
+      const logs = inMemoryStore.telemetryLogs
+        .filter(l => l.hive_id === hiveId)
+        .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+      return logs[0] || null;
+    }
+  },
+
+  async getTelemetryHistory(hiveId: string, limitVal: number, startDate?: string, endDate?: string) {
+    try {
+      const whereFilter: any = { hive_id: hiveId };
+      if (startDate || endDate) {
+        whereFilter.timestamp = {};
+        if (startDate) whereFilter.timestamp.gte = new Date(startDate);
+        if (endDate) whereFilter.timestamp.lte = new Date(endDate);
+      }
+      return await prisma.telemetryLog.findMany({
+        where: whereFilter,
+        orderBy: { timestamp: 'desc' },
+        take: limitVal
+      });
+    } catch {
+      let logs = inMemoryStore.telemetryLogs.filter(l => l.hive_id === hiveId);
+      if (startDate) logs = logs.filter(l => new Date(l.timestamp) >= new Date(startDate));
+      if (endDate) logs = logs.filter(l => new Date(l.timestamp) <= new Date(endDate));
+      logs.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+      return logs.slice(0, limitVal);
+    }
+  },
+
+  async getTelemetryStats(hiveId: string, cutoff: Date) {
+    try {
+      return await prisma.telemetryLog.findMany({
+        where: {
+          hive_id: hiveId,
+          timestamp: { gte: cutoff }
+        }
+      });
+    } catch {
+      return inMemoryStore.telemetryLogs.filter(l => l.hive_id === hiveId && new Date(l.timestamp) >= cutoff);
+    }
+  },
+
+  async createAlertConfig(data: any) {
+    const newAlert = {
+      id: crypto.randomUUID(),
+      hive_id: data.hive_id,
+      metric: data.metric,
+      condition: data.condition,
+      threshold: data.threshold,
+      notifyEmail: data.notifyEmail ?? true,
+      triggered: false,
+      createdAt: new Date()
+    };
+    try {
+      return await prisma.alertConfig.create({ data });
+    } catch {
+      inMemoryStore.alerts.push(newAlert);
+      return newAlert;
+    }
+  },
+
+  async getAlertConfigs(hiveId: string) {
+    try {
+      return await prisma.alertConfig.findMany({
+        where: { hive_id: hiveId },
+        orderBy: { createdAt: 'desc' }
+      });
+    } catch {
+      return inMemoryStore.alerts.filter(a => a.hive_id === hiveId);
+    }
+  },
+
+  async updateAlertTriggered(alertId: string, triggered: boolean) {
+    try {
+      await prisma.alertConfig.update({ where: { id: alertId }, data: { triggered } });
+    } catch {
+      const a = inMemoryStore.alerts.find(x => x.id === alertId);
+      if (a) a.triggered = triggered;
+    }
+  }
+};
+
+// -------------------------------------------------------------------------
+// ROUTES - IoT SYSTEM FULL API SPECIFICATION
 // -------------------------------------------------------------------------
 
-// --- Authentication ---
+// --- 1. AUTHENTICATION & USER MANAGEMENT ---
+
+// 1.1 Register User
 app.post('/api/v1/auth/register', async (req: Request, res: Response) => {
-  const { name, email, password, role, wallet_address } = req.body;
+  const { username, name, email, password, role, wallet_address } = req.body;
+  const userIdentifier = username || name;
   
-  if (!name || !email || !password || !role) {
-    return res.status(400).json({ error: 'Missing required registration parameters' });
+  if (!userIdentifier || !email || !password) {
+    return res.status(400).json({ success: false, error: 'Missing username, email, or password' });
   }
 
   try {
+    const existingUser = await dbService.findUserByEmailOrUsername(email, userIdentifier);
+    if (existingUser) {
+      return res.status(400).json({ success: false, error: 'Email or username already exists' });
+    }
+
     const passwordHash = await bcrypt.hash(password, 10);
-    const userRole = role as Role;
+    const userRole = (role as Role) || Role.FARMER;
     
-    const user = await prisma.user.create({
-      data: {
-        name,
-        email,
-        passwordHash,
-        wallet_address,
-        role: userRole
-      }
+    const user = await dbService.createUser({
+      name: userIdentifier,
+      username: userIdentifier,
+      email,
+      passwordHash,
+      wallet_address: wallet_address || null,
+      role: userRole
     });
 
-    const token = jwt.sign({ id: user.id, role: user.role, email: user.email }, JWT_SECRET, { expiresIn: '24h' });
+    const token = jwt.sign({ id: user.id, role: user.role, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
+    const formattedUserId = `usr_${user.id}`;
+
     res.status(201).json({
+      success: true,
+      message: 'User registered successfully',
       token,
-      user: { id: user.id, name: user.name, email: user.email, role: user.role, wallet_address: user.wallet_address }
+      user: { id: user.id, userId: formattedUserId, username: user.username, name: user.name, email: user.email, role: user.role, wallet_address: user.wallet_address },
+      data: {
+        userId: formattedUserId,
+        username: user.username || user.name,
+        email: user.email,
+        token
+      }
     });
   } catch (error: any) {
-    if (error.code === 'P2002') {
-      res.status(400).json({ error: 'Email already registered' });
-    } else {
-      res.status(500).json({ error: error.message });
-    }
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
+// 1.2 Login User
 app.post('/api/v1/auth/login', async (req: Request, res: Response) => {
   const { email, password } = req.body;
 
   if (!email || !password) {
-    return res.status(400).json({ error: 'Missing email or password' });
+    return res.status(400).json({ success: false, error: 'Missing email or password' });
   }
 
   try {
-    const user = await prisma.user.findUnique({ where: { email } });
-    if (!user) return res.status(404).json({ error: 'User not found' });
+    const user = await dbService.findUserByEmail(email);
+    if (!user) return res.status(401).json({ success: false, error: 'Invalid email or password' });
 
     const passwordMatch = await bcrypt.compare(password, user.passwordHash);
-    if (!passwordMatch) return res.status(401).json({ error: 'Incorrect credentials' });
+    if (!passwordMatch) return res.status(401).json({ success: false, error: 'Invalid email or password' });
 
-    const token = jwt.sign({ id: user.id, role: user.role, email: user.email }, JWT_SECRET, { expiresIn: '24h' });
+    const token = jwt.sign({ id: user.id, role: user.role, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
+    const formattedUserId = `usr_${user.id}`;
+
     res.json({
+      success: true,
       token,
-      user: { id: user.id, name: user.name, email: user.email, role: user.role, wallet_address: user.wallet_address }
+      user: { id: user.id, userId: formattedUserId, username: user.username || user.name, name: user.name, email: user.email, role: user.role, wallet_address: user.wallet_address },
+      data: {
+        userId: formattedUserId,
+        token,
+        expiresIn: '7d'
+      }
     });
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// --- Telemetry Ingestion ---
-app.post('/api/v1/telemetry/ingest', async (req: Request, res: Response) => {
-  const { hive_mac, weight_kg, temperature_c, humidity_pct, api_key } = req.body;
+// 1.3 Get User Profile
+app.get('/api/v1/auth/me', authenticateToken, async (req: AuthRequest, res: Response) => {
+  try {
+    const user = await dbService.findUserById(req.user!.id);
+    if (!user) return res.status(404).json({ success: false, error: 'User not found' });
 
-  if (api_key !== API_KEY_SECRET) {
-    return res.status(403).json({ error: 'Unauthorized hardware sensor payload signature' });
+    res.json({
+      success: true,
+      data: {
+        userId: `usr_${user.id}`,
+        username: user.username || user.name,
+        email: user.email,
+        createdAt: user.createdAt instanceof Date ? user.createdAt.toISOString() : new Date(user.createdAt).toISOString()
+      }
+    });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
   }
+});
 
-  if (!hive_mac || weight_kg === undefined || temperature_c === undefined || humidity_pct === undefined) {
-    return res.status(400).json({ error: 'Malformed sensor telemetry payload' });
+// --- 2. DEVICE MANAGEMENT ---
+
+// 2.1 Register New Device
+app.post('/api/v1/devices', authenticateToken, async (req: AuthRequest, res: Response) => {
+  const { deviceName, macAddress, location } = req.body;
+  if (!macAddress) {
+    return res.status(400).json({ success: false, error: 'Missing MAC address' });
   }
 
   try {
-    // 1. Look up the Hive in DB
-    let hive = await prisma.hive.findUnique({ where: { hardware_mac: hive_mac } });
-    
-    // Auto-create dummy Hive for debugging/developer-ease if it doesn't exist
+    const deviceApiKey = `esp_key_${crypto.randomBytes(9).toString('hex')}`;
+    const cleanMac = macAddress.toUpperCase();
+    const did = `did:honeychain:device:${cleanMac.replace(/:/g, '')}`;
+    const name = deviceName || `ESP32-Smart-Scale-${cleanMac.slice(-5)}`;
+
+    const existing = await dbService.findHiveByIdOrMac(cleanMac);
+    if (existing) {
+      return res.status(400).json({ success: false, error: 'Device with this MAC address already registered' });
+    }
+
+    const hive = await dbService.createHive({
+      deviceName: name,
+      hardware_mac: cleanMac,
+      cluster_location: location || 'Lab Workbench',
+      did_identifier: did,
+      deviceApiKey,
+      status: 'online',
+      lastActiveAt: new Date(),
+      farmer_id: req.user!.id
+    });
+
+    const formattedDeviceId = `dev_${hive.id}`;
+    const createdAtStr = hive.lastActiveAt ? (hive.lastActiveAt instanceof Date ? hive.lastActiveAt.toISOString() : new Date(hive.lastActiveAt).toISOString()) : new Date().toISOString();
+
+    res.status(201).json({
+      success: true,
+      data: {
+        deviceId: formattedDeviceId,
+        deviceName: hive.deviceName,
+        deviceApiKey: hive.deviceApiKey,
+        createdAt: createdAtStr
+      }
+    });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// 2.2 Get All User Devices
+app.get('/api/v1/devices', authenticateToken, async (req: AuthRequest, res: Response) => {
+  try {
+    const hives = await dbService.findHivesByFarmer(req.user!.id);
+
+    const now = Date.now();
+    const formatted = hives.map((h: any) => {
+      const isOnline = h.lastActiveAt && (now - new Date(h.lastActiveAt).getTime() < 300000);
+      return {
+        deviceId: `dev_${h.id}`,
+        deviceName: h.deviceName || h.hardware_mac,
+        macAddress: h.hardware_mac,
+        status: isOnline ? 'online' : 'offline',
+        lastActiveAt: h.lastActiveAt ? new Date(h.lastActiveAt).toISOString() : new Date().toISOString()
+      };
+    });
+
+    res.json({
+      success: true,
+      count: formatted.length,
+      data: formatted
+    });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// 2.3 Get Single Device Details
+app.get('/api/v1/devices/:deviceId', authenticateToken, async (req: AuthRequest, res: Response) => {
+  const { deviceId } = req.params;
+
+  try {
+    const hive = await dbService.findHiveByIdOrMac(deviceId);
+
+    if (!hive) return res.status(404).json({ success: false, error: 'Device not found' });
+
+    const now = Date.now();
+    const isOnline = hive.lastActiveAt && (now - new Date(hive.lastActiveAt).getTime() < 300000);
+
+    res.json({
+      success: true,
+      data: {
+        deviceId: `dev_${hive.id}`,
+        deviceName: hive.deviceName || hive.hardware_mac,
+        status: isOnline ? 'online' : 'offline',
+        samplingIntervalSec: hive.samplingIntervalSec || 5,
+        lastActiveAt: hive.lastActiveAt ? new Date(hive.lastActiveAt).toISOString() : new Date().toISOString()
+      }
+    });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// 2.4 Delete Device
+app.delete('/api/v1/devices/:deviceId', authenticateToken, async (req: AuthRequest, res: Response) => {
+  const { deviceId } = req.params;
+
+  try {
+    const hive = await dbService.findHiveByIdOrMac(deviceId);
+
+    if (!hive) return res.status(404).json({ success: false, error: 'Device not found' });
+
+    await dbService.deleteHive(hive.id);
+
+    res.json({
+      success: true,
+      message: 'Device deleted successfully'
+    });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// --- 3. TELEMETRY INGESTION (ESP32 HARDWARE SIDE) ---
+
+// 3.1 Push Sensor Readings
+app.post('/api/v1/telemetry', async (req: Request, res: Response) => {
+  const apiKeyHeader = req.headers['x-device-api-key'] as string;
+  const { deviceId, temperature, humidity, weightGrams, timestamp, api_key, hive_mac } = req.body;
+
+  const keyToTest = apiKeyHeader || api_key;
+
+  try {
+    let hive = null;
+
+    if (keyToTest) {
+      hive = await dbService.findHiveByApiKey(keyToTest);
+    }
+
+    if (!hive && deviceId) {
+      hive = await dbService.findHiveByIdOrMac(deviceId as string);
+    }
+
+    if (!hive && hive_mac) {
+      hive = await dbService.findHiveByIdOrMac(hive_mac as string);
+    }
+
+    if (!hive && keyToTest !== API_KEY_SECRET) {
+      return res.status(401).json({ success: false, error: 'Invalid Device API Key' });
+    }
+
+    // Auto-create fallback device if key matches global secret but no hive exists
     if (!hive) {
-      // Find or create a default farmer to assign the hive to
-      let farmer = await prisma.user.findFirst({ where: { role: Role.FARMER } });
+      let farmer = await dbService.findFirstFarmer();
       if (!farmer) {
         const dummyHash = await bcrypt.hash('password123', 10);
-        farmer = await prisma.user.create({
-          data: {
-            name: 'Demo Beekeeper',
-            email: 'farmer@honeychain.io',
-            passwordHash: dummyHash,
-            role: Role.FARMER,
-            wallet_address: '0x90F8bf6A479f320ead074411a4B0e7944Ea8c9C1' // Standard hardhat test address #1
-          }
+        farmer = await dbService.createUser({
+          name: 'Demo Beekeeper',
+          username: 'demobeekeeper',
+          email: 'farmer@honeychain.io',
+          passwordHash: dummyHash,
+          role: Role.FARMER
         });
       }
 
-      hive = await prisma.hive.create({
-        data: {
-          hardware_mac: hive_mac,
-          cluster_location: 'Karnataka Honey Cluster, IN',
-          did_identifier: `did:honeychain:hive:${hive_mac.toLowerCase().replace(/:/g, '')}`,
-          farmer_id: farmer.id
-        }
+      const mac = hive_mac || `24:6F:28:${crypto.randomBytes(3).toString('hex').toUpperCase().match(/../g)?.join(':')}`;
+      hive = await dbService.createHive({
+        deviceName: 'ESP32-Smart-Scale-DHT11',
+        hardware_mac: mac,
+        cluster_location: 'Lab Workbench',
+        did_identifier: `did:honeychain:device:${mac.replace(/:/g, '')}`,
+        deviceApiKey: keyToTest || `esp_key_${crypto.randomBytes(9).toString('hex')}`,
+        status: 'online',
+        lastActiveAt: new Date(),
+        farmer_id: farmer.id
       });
+    }
+
+    // Update hive status & lastActiveAt
+    await dbService.updateHiveStatus(hive.id, 'online', new Date());
+
+    const tempVal = parseFloat(temperature ?? 0);
+    const humVal = parseFloat(humidity ?? 0);
+    const weightValGrams = parseFloat(weightGrams ?? 0);
+    const weightKgVal = weightValGrams / 1000;
+
+    let recDate = new Date();
+    if (timestamp) {
+      const tsNum = typeof timestamp === 'number' ? timestamp : parseInt(timestamp);
+      recDate = new Date(tsNum < 10000000000 ? tsNum * 1000 : tsNum);
     }
 
     const logEntry = {
       hive_id: hive.id,
-      weight_kg: parseFloat(weight_kg),
-      temperature_c: parseFloat(temperature_c),
-      humidity_pct: parseFloat(humidity_pct),
-      timestamp: new Date().toISOString(),
-      zk_proof_hash: "0x" + crypto.createHash('sha256').update(`${hive_mac}-${weight_kg}-${Date.now()}`).digest('hex')
+      weight_kg: weightKgVal,
+      temperature_c: tempVal,
+      humidity_pct: humVal,
+      timestamp: recDate.toISOString(),
+      zk_proof_hash: '0x' + crypto.createHash('sha256').update(`${hive.hardware_mac}-${weightValGrams}-${Date.now()}`).digest('hex')
     };
 
-    // 2. Cache in Redis
+    // Cache in Redis
     await cacheTelemetry(hive.id, logEntry);
 
-    // 3. Batch commit to Postgres DB
-    const telemetry = await prisma.telemetryLog.create({
-      data: {
-        hive_id: logEntry.hive_id,
-        weight_kg: logEntry.weight_kg,
-        temperature_c: logEntry.temperature_c,
-        humidity_pct: logEntry.humidity_pct,
-        timestamp: new Date(logEntry.timestamp),
-        zk_proof_hash: logEntry.zk_proof_hash
-      }
+    // Save in DB/Store
+    await dbService.createTelemetryLog({
+      hive_id: hive.id,
+      weight_kg: weightKgVal,
+      temperature_c: tempVal,
+      humidity_pct: humVal,
+      timestamp: recDate,
+      zk_proof_hash: logEntry.zk_proof_hash
     });
 
-    // 4. Hit ML Predictor asynchronously for realtime analysis
-    // Get rolling history from Cache to supply to ML
-    const history = await getCachedTelemetry(hive.id);
-    let mlPrediction = null;
-    try {
-      const mlResponse = await axios.post(`${ML_SERVICE_URL}/predict/yield`, {
-        hive_id: hive.id,
-        telemetry_history: history.map(h => ({
-          weight_kg: h.weight_kg,
-          temperature_c: h.temperature_c,
-          humidity_pct: h.humidity_pct,
-          timestamp: h.timestamp
-        }))
+    // Check & evaluate alert rules
+    const alerts = await dbService.getAlertConfigs(hive.id);
+    for (const alert of alerts) {
+      let metricVal = 0;
+      if (alert.metric === 'weightGrams' || alert.metric === 'weight') metricVal = weightValGrams;
+      else if (alert.metric === 'temperature') metricVal = tempVal;
+      else if (alert.metric === 'humidity') metricVal = humVal;
+
+      let triggered = false;
+      if (alert.condition === 'LESS_THAN' && metricVal < alert.threshold) triggered = true;
+      if (alert.condition === 'GREATER_THAN' && metricVal > alert.threshold) triggered = true;
+      if (alert.condition === 'EQUAL' && metricVal === alert.threshold) triggered = true;
+
+      if (triggered) {
+        await dbService.updateAlertTriggered(alert.id, true);
+      }
+    }
+
+    res.status(201).json({
+      success: true,
+      message: 'Telemetry recorded successfully'
+    });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Legacy / Ingest alias
+app.post('/api/v1/telemetry/ingest', async (req: Request, res: Response) => {
+  const { weight_kg, weightGrams, temperature_c, temperature, humidity_pct, humidity } = req.body;
+  req.body.weightGrams = weightGrams ?? (weight_kg ? weight_kg * 1000 : 0);
+  req.body.temperature = temperature ?? temperature_c;
+  req.body.humidity = humidity ?? humidity_pct;
+  
+  return app._router.handle(req, res, () => {});
+});
+
+// --- 4. TELEMETRY ANALYTICS & DASHBOARD (FRONTEND SIDE) ---
+
+// 4.1 Get Latest Live Telemetry
+app.get('/api/v1/telemetry/live', authenticateToken, async (req: AuthRequest, res: Response) => {
+  const { deviceId } = req.query;
+  if (!deviceId) return res.status(400).json({ success: false, error: 'deviceId query parameter is required' });
+
+  try {
+    const hive = await dbService.findHiveByIdOrMac(deviceId as string);
+
+    if (!hive) return res.status(404).json({ success: false, error: 'Device not found' });
+
+    const latest = await dbService.getLatestTelemetryLog(hive.id);
+
+    if (!latest) {
+      return res.json({
+        success: true,
+        data: {
+          deviceId: `dev_${hive.id}`,
+          temperature: 0,
+          humidity: 0,
+          weightGrams: 0,
+          recordedAt: new Date().toISOString()
+        }
       });
-      mlPrediction = mlResponse.data;
-    } catch (e: any) {
-      console.warn('ML yield forecasting service unavailable:', e.message);
     }
 
     res.json({
       success: true,
-      telemetry,
-      mlPrediction
+      data: {
+        deviceId: `dev_${hive.id}`,
+        temperature: latest.temperature_c,
+        humidity: latest.humidity_pct,
+        weightGrams: Math.round(latest.weight_kg * 1000 * 100) / 100,
+        recordedAt: latest.timestamp instanceof Date ? latest.timestamp.toISOString() : new Date(latest.timestamp).toISOString()
+      }
     });
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// Get Live Hive Telemetry
+// 4.2 Get Historical Telemetry Logs
+app.get('/api/v1/telemetry/history', authenticateToken, async (req: AuthRequest, res: Response) => {
+  const { deviceId, limit, startDate, endDate } = req.query;
+  if (!deviceId) return res.status(400).json({ success: false, error: 'deviceId query parameter is required' });
+
+  const limitVal = Math.min(parseInt((limit as string) || '50'), 1000);
+
+  try {
+    const hive = await dbService.findHiveByIdOrMac(deviceId as string);
+
+    if (!hive) return res.status(404).json({ success: false, error: 'Device not found' });
+
+    const logs = await dbService.getTelemetryHistory(hive.id, limitVal, startDate as string, endDate as string);
+
+    const formatted = logs.map((l: any, index: number) => ({
+      id: 1000 + index,
+      temperature: l.temperature_c,
+      humidity: l.humidity_pct,
+      weightGrams: Math.round(l.weight_kg * 1000 * 100) / 100,
+      recordedAt: l.timestamp instanceof Date ? l.timestamp.toISOString() : new Date(l.timestamp).toISOString()
+    }));
+
+    res.json({
+      success: true,
+      count: formatted.length,
+      data: formatted
+    });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// 4.3 Get Aggregated Statistics
+app.get('/api/v1/telemetry/stats', authenticateToken, async (req: AuthRequest, res: Response) => {
+  const { deviceId, range } = req.query;
+  if (!deviceId) return res.status(400).json({ success: false, error: 'deviceId query parameter is required' });
+
+  const rangeStr = (range as string) || '24h';
+
+  try {
+    const hive = await dbService.findHiveByIdOrMac(deviceId as string);
+
+    if (!hive) return res.status(404).json({ success: false, error: 'Device not found' });
+
+    const cutoff = new Date();
+    if (rangeStr === '1h') cutoff.setHours(cutoff.getHours() - 1);
+    else if (rangeStr === '7d') cutoff.setDate(cutoff.getDate() - 7);
+    else cutoff.setHours(cutoff.getHours() - 24); // default 24h
+
+    const logs = await dbService.getTelemetryStats(hive.id, cutoff);
+
+    if (logs.length === 0) {
+      return res.json({
+        success: true,
+        range: rangeStr,
+        data: {
+          temperature: { min: 0, max: 0, avg: 0 },
+          humidity: { min: 0, max: 0, avg: 0 },
+          weightGrams: { min: 0, max: 0, avg: 0 }
+        }
+      });
+    }
+
+    const temps = logs.map((l: any) => l.temperature_c);
+    const hums = logs.map((l: any) => l.humidity_pct);
+    const weights = logs.map((l: any) => l.weight_kg * 1000);
+
+    const calcStats = (arr: number[]) => {
+      const min = Math.min(...arr);
+      const max = Math.max(...arr);
+      const avg = arr.reduce((a, b) => a + b, 0) / arr.length;
+      return {
+        min: Math.round(min * 100) / 100,
+        max: Math.round(max * 100) / 100,
+        avg: Math.round(avg * 100) / 100
+      };
+    };
+
+    res.json({
+      success: true,
+      range: rangeStr,
+      data: {
+        temperature: calcStats(temps),
+        humidity: calcStats(hums),
+        weightGrams: calcStats(weights)
+      }
+    });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// --- 5. ALERTS & NOTIFICATIONS ---
+
+// 5.1 Set Sensor Threshold Alert
+app.post('/api/v1/alerts/config', authenticateToken, async (req: AuthRequest, res: Response) => {
+  const { deviceId, metric, condition, threshold, notifyEmail } = req.body;
+  if (!deviceId || !metric || !condition || threshold === undefined) {
+    return res.status(400).json({ success: false, error: 'Missing required alert configuration fields' });
+  }
+
+  try {
+    const hive = await dbService.findHiveByIdOrMac(deviceId);
+
+    if (!hive) return res.status(404).json({ success: false, error: 'Device not found' });
+
+    const alert = await dbService.createAlertConfig({
+      hive_id: hive.id,
+      metric,
+      condition,
+      threshold: parseFloat(threshold),
+      notifyEmail: notifyEmail !== undefined ? Boolean(notifyEmail) : true
+    });
+
+    res.status(201).json({
+      success: true,
+      alertId: `alt_${alert.id}`
+    });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// 5.2 Get Device Alerts
+app.get('/api/v1/alerts', authenticateToken, async (req: AuthRequest, res: Response) => {
+  const { deviceId } = req.query;
+  if (!deviceId) return res.status(400).json({ success: false, error: 'deviceId query parameter required' });
+
+  try {
+    const hive = await dbService.findHiveByIdOrMac(deviceId as string);
+
+    if (!hive) return res.status(404).json({ success: false, error: 'Device not found' });
+
+    const alerts = await dbService.getAlertConfigs(hive.id);
+
+    res.json({
+      success: true,
+      data: alerts.map((a: any) => ({
+        alertId: `alt_${a.id}`,
+        deviceId: `dev_${a.hive_id}`,
+        metric: a.metric,
+        condition: a.condition,
+        threshold: a.threshold,
+        notifyEmail: a.notifyEmail,
+        triggered: a.triggered,
+        createdAt: a.createdAt instanceof Date ? a.createdAt.toISOString() : new Date(a.createdAt).toISOString()
+      }))
+    });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+
+// Legacy Get Live Hive Telemetry
 app.get('/api/v1/hives/:hiveId/telemetry', async (req: Request, res: Response) => {
   const { hiveId } = req.params;
   try {
@@ -535,6 +1175,7 @@ app.get('/api/v1/hives/:hiveId/telemetry', async (req: Request, res: Response) =
     res.status(500).json({ error: error.message });
   }
 });
+
 
 // List farmer hives
 app.get('/api/v1/farmer/hives', authenticateToken, async (req: AuthRequest, res: Response) => {

@@ -23,6 +23,7 @@ enum BatchState {
 model User {
   id             String      @id @default(uuid())
   name           String
+  username       String?     @unique
   email          String      @unique
   passwordHash   String
   wallet_address String?
@@ -33,14 +34,20 @@ model User {
 }
 
 model Hive {
-  id               String         @id @default(uuid())
-  hardware_mac     String         @unique
-  cluster_location String
-  did_identifier   String         @unique
-  farmer_id        String
-  farmer           User           @relation(fields: [farmer_id], references: [id])
-  batches          Batch[]
-  telemetryLogs    TelemetryLog[]
+  id                  String         @id @default(uuid())
+  deviceName          String?
+  hardware_mac        String         @unique
+  cluster_location    String
+  did_identifier      String         @unique
+  deviceApiKey        String?        @unique
+  status              String         @default("offline")
+  samplingIntervalSec Int            @default(5)
+  lastActiveAt        DateTime?
+  farmer_id           String
+  farmer              User           @relation(fields: [farmer_id], references: [id])
+  batches             Batch[]
+  telemetryLogs       TelemetryLog[]
+  alerts              AlertConfig[]
 }
 
 model Batch {
@@ -67,6 +74,18 @@ model TelemetryLog {
   zk_proof_hash  String?
 }
 
+model AlertConfig {
+  id          String   @id @default(uuid())
+  hive_id     String
+  hive        Hive     @relation(fields: [hive_id], references: [id], onDelete: Cascade)
+  metric      String
+  condition   String
+  threshold   Float
+  notifyEmail Boolean  @default(true)
+  triggered   Boolean  @default(false)
+  createdAt   DateTime @default(now())
+}
+
 model LabReport {
   id                 String   @id @default(uuid())
   batch_id           String   @unique
@@ -79,3 +98,4 @@ model LabReport {
   pdf_ipfs_hash      String
   createdAt          DateTime @default(now())
 }
+
